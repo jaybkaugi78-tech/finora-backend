@@ -1,11 +1,21 @@
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
-from sqlalchemy import func, or_
+from sqlalchemy import func
 
 from app.extensions import db
-from app.models import Account, Category, Transaction
+
+from app.models import (
+    Account,
+    Bill,
+    Budget,
+    Category,
+    Goal,
+    Notification,
+    Transaction,
+)
+
 from app.services.finance_service import (
     account_total,
     month_bounds,
@@ -13,6 +23,7 @@ from app.services.finance_service import (
     safe_to_spend,
     upcoming_bills_total,
 )
+
 from app.utils.auth import current_user
 
 
@@ -21,6 +32,10 @@ analytics_bp = Blueprint(
     __name__,
 )
 
+
+# =========================================================
+# HELPERS
+# =========================================================
 
 def valid_period(year, month):
     return (
@@ -145,13 +160,30 @@ def savings_rate(
     )
 
 
+# =========================================================
+# DASHBOARD
+# =========================================================
+
 @analytics_bp.get(
     "/dashboard"
 )
 @jwt_required()
 def dashboard():
     user = current_user()
+
     now = datetime.utcnow()
+    today = date.today()
+
+    # -----------------------------------------------------
+    # CURRENT MONTH
+    # -----------------------------------------------------
+
+    month_start, month_end = (
+        month_bounds(
+            now.year,
+            now.month,
+        )
+    )
 
     income, expenses = (
         month_totals(
@@ -161,11 +193,52 @@ def dashboard():
         )
     )
 
+    income = float(
+        income or 0
+    )
+
+    expenses = float(
+        expenses or 0
+    )
+
+    net_cash_flow = (
+        income
+        - expenses
+    )
+
+    current_savings_rate = (
+        savings_rate(
+            income,
+            expenses,
+        )
+    )
+
+    # -----------------------------------------------------
+    # BALANCE + SAFE TO SPEND
+    # -----------------------------------------------------
+
+    available_balance = (
+        account_total(
+            user.id
+        )
+    )
+
     safe = safe_to_spend(
         user.id
     )
 
-    recent = (
+    upcoming_total = (
+        upcoming_bills_total(
+            user.id,
+            30,
+        )
+    )
+
+    # -----------------------------------------------------
+    # RECENT TRANSACTIONS
+    # -----------------------------------------------------
+
+    recent_transactions = (
         Transaction.query
         .filter_by(
             user_id=user.id
@@ -179,11 +252,282 @@ def dashboard():
         .all()
     )
 
-    return jsonify({
-        "available_balance":
-            account_total(
-                user.id
+    # -----------------------------------------------------
+    # MONTHLY TRANSACTION COUNT
+    # -----------------------------------------------------
+
+    transaction_count = (
+        Transaction.query
+        .filter(
+            Transaction.user_id
+            == user.id,
+
+            Transaction.transaction_date
+            >= month_start,
+
+            Transaction.transaction_date
+            < month_end,
+        )
+        .count()
+    )
+
+    # -----------------------------------------------------
+    # ACCOUNTS
+    # -----------------------------------------------------
+
+    accounts = (
+        Account.query
+        .filter_by(
+            user_id=user.id,
+            is_archived=False,
+        )
+        .order_by(
+            Account.is_default.desc(),
+            Account.created_at.asc(),
+        )
+        .limit(4)
+        .all()
+    )
+
+    account_items = [
+        account.to_dict()
+        for account in accounts
+    ]
+
+    # -----------------------------------------------------
+    # UPCOMING BILLS
+    # -----------------------------------------------------
+
+    bill_cutoff = (
+        today
+        + timedelta(days=30)
+    )
+
+    upcoming_bills = (
+        Bill.query
+        .filter(
+            Bill.user_id
+            == user.id,
+
+            Bill.is_active.is_(True),
+
+            Bill.next_due_date
+            >= today,
+
+            Bill.next_due_date
+            <= bill_cutoff,
+        )
+        .order_by(
+            Bill.next_due_date.asc()
+        )
+        .limit(4)
+        .all()
+    )
+
+    bill_items = []
+
+    for bill in upcoming_bills:
+        bill_data = (
+            bill.to_dict()
+        )
+
+        bill_data[
+            "days_until_due"
+        ] = (
+            bill.next_due_date
+            - today
+        ).days
+
+        bill_items.append(
+            bill_data
+        )
+
+    # -----------------------------------------------------
+    # ACTIVE GOALS
+    # -----------------------------------------------------
+
+    goals = (
+        Goal.query
+        .filter(
+            Goal.user_id
+            == user.id,
+
+            Goal.is_completed
+            .is_(False),
+        )
+        .order_by(
+            Goal.target_date
+            .asc()
+            .nullslast(),
+
+            Goal.created_at.asc(),
+        )
+        .limit(3)
+        .all()
+    )
+
+    goal_items = [
+        goal.to_dict()
+        for goal in goals
+    ]
+
+    # -----------------------------------------------------
+    # CURRENT MONTH BUDGETS
+    # -----------------------------------------------------
+
+    budgets = (
+        Budget.query
+        .filter_by(
+            user_id=user.id,
+            month=now.month,
+            year=now.year,
+        )
+        .all()
+    )
+
+    budget_items = []
+
+    total_budget = 0
+    total_budget_spent = 0
+
+    for budget in budgets:
+
+        spent = (
+            db.session.query(
+                func.coalesce(
+                    func.sum(
+                        Transaction.amount
+                    ),
+                    0,
+                )
+            )
+            .filter(
+                Transaction.user_id
+                == user.id,
+
+                Transaction.category_id
+                == budget.category_id,
+
+                Transaction.transaction_type
+                == "expense",
+
+                Transaction.transaction_date
+                >= month_start,
+
+                Transaction.transaction_date
+                < month_end,
+            )
+            .scalar()
+        )
+
+        spent = float(
+            spent or 0
+        )
+
+        amount = float(
+            budget.amount or 0
+        )
+
+        percentage = (
+            round(
+                (
+                    spent
+                    / amount
+                )
+                * 100,
+                1,
+            )
+            if amount
+            else 0
+        )
+
+        total_budget += amount
+
+        total_budget_spent += (
+            spent
+        )
+
+        budget_items.append({
+            "id":
+                budget.id,
+
+            "category_id":
+                budget.category_id,
+
+            "category": (
+                budget.category.to_dict()
+                if budget.category
+                else None
             ),
+
+            "amount":
+                amount,
+
+            "spent":
+                spent,
+
+            "remaining":
+                max(
+                    amount
+                    - spent,
+                    0,
+                ),
+
+            "percentage":
+                percentage,
+
+            "is_over_budget":
+                spent > amount,
+        })
+
+    # Show budgets closest to / over
+    # their limit first.
+
+    budget_items.sort(
+        key=lambda item:
+            item["percentage"],
+        reverse=True,
+    )
+
+    budget_percentage = (
+        round(
+            (
+                total_budget_spent
+                / total_budget
+            )
+            * 100,
+            1,
+        )
+        if total_budget
+        else 0
+    )
+
+    # -----------------------------------------------------
+    # NOTIFICATIONS
+    # -----------------------------------------------------
+
+    unread_notifications = (
+        Notification.query
+        .filter_by(
+            user_id=user.id,
+            is_read=False,
+        )
+        .count()
+    )
+
+    # -----------------------------------------------------
+    # RESPONSE
+    # -----------------------------------------------------
+
+    return jsonify({
+
+        "available_balance":
+            available_balance,
+
+        "safe_to_spend":
+            safe[
+                "safe_to_spend"
+            ],
 
         "income_this_month":
             income,
@@ -191,24 +535,72 @@ def dashboard():
         "expenses_this_month":
             expenses,
 
-        "upcoming_bills":
-            upcoming_bills_total(
-                user.id,
-                30,
-            ),
+        "net_cash_flow":
+            net_cash_flow,
 
-        "safe_to_spend":
-            safe[
-                "safe_to_spend"
-            ],
+        "savings_rate":
+            current_savings_rate,
+
+        "upcoming_bills":
+            upcoming_total,
+
+        "transaction_count":
+            transaction_count,
+
+        "unread_notifications":
+            unread_notifications,
 
         "recent_transactions": [
             transaction.to_dict()
             for transaction
-            in recent
+            in recent_transactions
         ],
+
+        "accounts":
+            account_items,
+
+        "upcoming_bill_items":
+            bill_items,
+
+        "goals":
+            goal_items,
+
+        "budget_summary": {
+            "total_budget":
+                round(
+                    total_budget,
+                    2,
+                ),
+
+            "spent":
+                round(
+                    total_budget_spent,
+                    2,
+                ),
+
+            "remaining":
+                round(
+                    max(
+                        total_budget
+                        - total_budget_spent,
+                        0,
+                    ),
+                    2,
+                ),
+
+            "percentage":
+                budget_percentage,
+        },
+
+        "budgets":
+            budget_items[:4],
+
     }), 200
 
+
+# =========================================================
+# ANALYTICS SUMMARY
+# =========================================================
 
 @analytics_bp.get(
     "/summary"
@@ -336,6 +728,10 @@ def analytics_summary():
     }), 200
 
 
+# =========================================================
+# SPENDING BY CATEGORY
+# =========================================================
+
 @analytics_bp.get(
     "/spending-by-category"
 )
@@ -458,6 +854,10 @@ def spending_by_category():
     }), 200
 
 
+# =========================================================
+# MONTHLY TREND
+# =========================================================
+
 @analytics_bp.get(
     "/monthly-trend"
 )
@@ -474,6 +874,7 @@ def monthly_trend():
                 6,
             )
         )
+
     except (TypeError, ValueError):
         months = 6
 
@@ -545,6 +946,10 @@ def monthly_trend():
             points
     }), 200
 
+
+# =========================================================
+# ACCOUNT BREAKDOWN
+# =========================================================
 
 @analytics_bp.get(
     "/accounts"
@@ -621,6 +1026,10 @@ def account_breakdown():
             rows,
     }), 200
 
+
+# =========================================================
+# INSIGHTS
+# =========================================================
 
 @analytics_bp.get(
     "/insights"
