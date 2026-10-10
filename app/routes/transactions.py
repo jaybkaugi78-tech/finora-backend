@@ -1,452 +1,77 @@
-from datetime import datetime
-
-from flask import Blueprint, jsonify, request
+import hashlib,json
+from flask import Blueprint,jsonify,request
 from flask_jwt_extended import jwt_required
-
-from app.extensions import db
-from app.models import Account, Category, Transaction
-from app.services.finance_service import apply_transaction_to_accounts
-from app.utils.auth import current_user
-
-
-transactions_bp = Blueprint("transactions", __name__)
-
-VALID_TYPES = {
-    "income",
-    "expense",
-    "transfer",
-}
-
-
-def parse_date(value):
-    if not value:
-        return datetime.utcnow()
-
-    return datetime.fromisoformat(
-        value.replace("Z", "+00:00")
-    ).replace(tzinfo=None)
-
-
-def get_user_account(account_id, user_id):
-    if not account_id:
-        return None
-
-    return Account.query.filter_by(
-        id=account_id,
-        user_id=user_id,
-    ).first()
-
-
-def get_user_category(category_id, user_id):
-    if not category_id:
-        return None
-
-    return Category.query.filter_by(
-        id=category_id,
-        user_id=user_id,
-    ).first()
-
-
-def validate_transaction_accounts(
-    user,
-    kind,
-    account_id,
-    destination_account_id=None,
-):
-    source = get_user_account(
-        account_id,
-        user.id,
-    )
-
-    if not source:
-        raise ValueError("Account not found.")
-
-    destination = None
-
-    if kind == "transfer":
-        destination = get_user_account(
-            destination_account_id,
-            user.id,
-        )
-
-        if not destination:
-            raise ValueError(
-                "Destination account not found."
-            )
-
-        if destination.id == source.id:
-            raise ValueError(
-                "Transfer accounts must be different."
-            )
-
-    return source, destination
-
-
-@transactions_bp.get("")
+from sqlalchemy.exc import IntegrityError
+from ..extensions import db
+from ..models import Transaction,IdempotencyKey
+from ..services.finance import amount,lock_accounts,apply
+from .common import uid,body,fail,category_for,parse_datetime
+bp=Blueprint('transactions',__name__)
+def validate(d,user_id,existing=None):
+    typ=d.get('transaction_type',existing.transaction_type if existing else None)
+    if typ not in ('income','expense','transfer'): raise ValueError('Invalid transaction type.')
+    n=amount(d.get('amount',existing.amount if existing else None))
+    aid=int(d.get('account_id',existing.account_id if existing else 0))
+    dest=d.get('destination_account_id',existing.destination_account_id if existing else None)
+    dest=int(dest) if dest not in ('',None) else None
+    if typ!='transfer': dest=None
+    if typ=='transfer' and (dest is None or dest==aid): raise ValueError('Choose a different destination account.')
+    cid=d.get('category_id',existing.category_id if existing else None)
+    cid=int(cid) if cid not in ('',None) else None
+    cat=category_for(user_id,cid)
+    if cat and cat.category_type!=typ and typ!='transfer': raise ValueError('Category type does not match transaction type.')
+    dt=parse_datetime(d['transaction_date']) if d.get('transaction_date') else (existing.transaction_date if existing else None)
+    return dict(transaction_type=typ,amount=n,account_id=aid,destination_account_id=dest,category_id=cid,merchant=d.get('merchant',existing.merchant if existing else None),description=d.get('description',existing.description if existing else None),notes=d.get('notes',existing.notes if existing else None),is_recurring=bool(d.get('is_recurring',existing.is_recurring if existing else False)),**({'transaction_date':dt} if dt else {}))
+@bp.get('/transactions')
 @jwt_required()
-def list_transactions():
-    user = current_user()
-
-    query = Transaction.query.filter_by(
-        user_id=user.id
-    )
-
-    transaction_type = request.args.get("type")
-    category_id = request.args.get("category_id")
-    account_id = request.args.get("account_id")
-    search = request.args.get("search")
-
-    if transaction_type:
-        query = query.filter_by(
-            transaction_type=transaction_type
-        )
-
-    if category_id:
-        try:
-            query = query.filter_by(
-                category_id=int(category_id)
-            )
-        except ValueError:
-            return jsonify({
-                "error": "Invalid category."
-            }), 400
-
-    if account_id:
-        try:
-            account_id = int(account_id)
-        except ValueError:
-            return jsonify({
-                "error": "Invalid account."
-            }), 400
-
-        query = query.filter(
-            db.or_(
-                Transaction.account_id == account_id,
-                Transaction.destination_account_id
-                == account_id,
-            )
-        )
-
-    if search:
-        pattern = f"%{search.strip()}%"
-
-        query = query.filter(
-            db.or_(
-                Transaction.merchant.ilike(pattern),
-                Transaction.description.ilike(pattern),
-                Transaction.notes.ilike(pattern),
-            )
-        )
-
-    transactions = (
-        query
-        .order_by(
-            Transaction.transaction_date.desc(),
-            Transaction.id.desc(),
-        )
-        .all()
-    )
-
-    return jsonify({
-        "transactions": [
-            transaction.to_dict()
-            for transaction in transactions
-        ]
-    }), 200
-
-
-@transactions_bp.post("")
+def listing():
+    q=Transaction.query.filter_by(user_id=uid())
+    if request.args.get('type'): q=q.filter_by(transaction_type=request.args['type'])
+    if request.args.get('account_id'):
+        aid=int(request.args['account_id']);q=q.filter((Transaction.account_id==aid)|(Transaction.destination_account_id==aid))
+    if request.args.get('category_id'): q=q.filter_by(category_id=int(request.args['category_id']))
+    if request.args.get('search'):
+        s=f"%{request.args['search']}%";q=q.filter((Transaction.merchant.ilike(s))|(Transaction.description.ilike(s)))
+    return jsonify(transactions=[t.to_dict() for t in q.order_by(Transaction.transaction_date.desc(),Transaction.id.desc()).limit(500)])
+@bp.post('/transactions')
 @jwt_required()
-def create_transaction():
-    user = current_user()
-    data = request.get_json() or {}
-
-    kind = (
-        data.get("transaction_type") or ""
-    ).strip().lower()
-
-    if kind not in VALID_TYPES:
-        return jsonify({
-            "error": "Invalid transaction type."
-        }), 400
-
+def create():
+    user=uid();d=body();key=request.headers.get('Idempotency-Key','').strip()
+    if len(key)>128: return fail('Idempotency key too long.')
+    payload_hash=hashlib.sha256(json.dumps(d,sort_keys=True,separators=(',',':')).encode()).hexdigest()
     try:
-        amount = float(data.get("amount"))
-
-        if amount <= 0:
-            raise ValueError(
-                "Amount must be greater than zero."
-            )
-
-        source, destination = (
-            validate_transaction_accounts(
-                user=user,
-                kind=kind,
-                account_id=data.get("account_id"),
-                destination_account_id=data.get(
-                    "destination_account_id"
-                ),
-            )
-        )
-
-        category_id = None
-
-        if kind != "transfer":
-            category = get_user_category(
-                data.get("category_id"),
-                user.id,
-            )
-
-            if not category:
-                raise ValueError(
-                    "Category not found."
-                )
-
-            if category.category_type != kind:
-                raise ValueError(
-                    f"Please select an {kind} category."
-                )
-
-            category_id = category.id
-
-        transaction = Transaction(
-            user_id=user.id,
-            transaction_type=kind,
-            amount=amount,
-            account_id=source.id,
-            destination_account_id=(
-                destination.id
-                if destination
-                else None
-            ),
-            category_id=category_id,
-            merchant=(
-                data.get("merchant") or ""
-            ).strip() or None,
-            description=(
-                data.get("description") or ""
-            ).strip() or None,
-            notes=(
-                data.get("notes") or ""
-            ).strip() or None,
-            transaction_date=parse_date(
-                data.get("transaction_date")
-            ),
-            is_recurring=bool(
-                data.get("is_recurring", False)
-            ),
-        )
-
-        db.session.add(transaction)
-        db.session.flush()
-
-        apply_transaction_to_accounts(
-            transaction
-        )
-
-        db.session.commit()
-
-        return jsonify({
-            "transaction": transaction.to_dict()
-        }), 201
-
-    except (ValueError, TypeError) as exc:
+        if key:
+            prev=IdempotencyKey.query.filter_by(user_id=user,key=key).first()
+            if prev:
+                if prev.payload_hash!=payload_hash: return fail('Idempotency key reused with different data.',409)
+                return jsonify(prev.response_json),200
+        vals=validate(d,user)
+        accounts=lock_accounts(user,[vals['account_id'],vals['destination_account_id']])
+        tx=Transaction(user_id=user,**vals);db.session.add(tx);apply(tx,accounts)
+        db.session.flush();result={'transaction':tx.to_dict()}
+        if key: db.session.add(IdempotencyKey(user_id=user,key=key,payload_hash=payload_hash,response_json=result))
+        db.session.commit();return jsonify(result),201
+    except (ValueError,TypeError) as e: db.session.rollback();return fail(e)
+    except IntegrityError:
         db.session.rollback()
-
-        return jsonify({
-            "error": str(exc)
-        }), 400
-
-
-@transactions_bp.get("/<int:transaction_id>")
+        if key:
+            prev=IdempotencyKey.query.filter_by(user_id=user,key=key).first()
+            if prev and prev.payload_hash==payload_hash:return jsonify(prev.response_json),200
+        return fail('Conflicting request.',409)
+@bp.route('/transactions/<int:id>',methods=['GET','PATCH','PUT','DELETE'])
 @jwt_required()
-def get_transaction(transaction_id):
-    user = current_user()
-
-    transaction = Transaction.query.filter_by(
-        id=transaction_id,
-        user_id=user.id,
-    ).first_or_404()
-
-    return jsonify({
-        "transaction": transaction.to_dict()
-    }), 200
-
-
-@transactions_bp.patch("/<int:transaction_id>")
-@jwt_required()
-def update_transaction(transaction_id):
-    user = current_user()
-
-    transaction = Transaction.query.filter_by(
-        id=transaction_id,
-        user_id=user.id,
-    ).first_or_404()
-
-    data = request.get_json() or {}
-
+def item(id):
+    user=uid();tx=Transaction.query.filter_by(id=id,user_id=user).first()
+    if not tx:return fail('Transaction not found.',404)
+    if request.method=='GET':return jsonify(transaction=tx.to_dict())
     try:
-        # First undo the ORIGINAL transaction.
-        apply_transaction_to_accounts(
-            transaction,
-            reverse=True,
-        )
-
-        kind = (
-            data.get(
-                "transaction_type",
-                transaction.transaction_type,
-            )
-            or ""
-        ).strip().lower()
-
-        if kind not in VALID_TYPES:
-            raise ValueError(
-                "Invalid transaction type."
-            )
-
-        amount = float(
-            data.get(
-                "amount",
-                transaction.amount,
-            )
-        )
-
-        if amount <= 0:
-            raise ValueError(
-                "Amount must be greater than zero."
-            )
-
-        account_id = data.get(
-            "account_id",
-            transaction.account_id,
-        )
-
-        destination_account_id = data.get(
-            "destination_account_id",
-            transaction.destination_account_id,
-        )
-
-        source, destination = (
-            validate_transaction_accounts(
-                user=user,
-                kind=kind,
-                account_id=account_id,
-                destination_account_id=(
-                    destination_account_id
-                    if kind == "transfer"
-                    else None
-                ),
-            )
-        )
-
-        category_id = None
-
-        if kind != "transfer":
-            requested_category_id = data.get(
-                "category_id",
-                transaction.category_id,
-            )
-
-            category = get_user_category(
-                requested_category_id,
-                user.id,
-            )
-
-            if not category:
-                raise ValueError(
-                    "Category not found."
-                )
-
-            if category.category_type != kind:
-                raise ValueError(
-                    f"Please select an {kind} category."
-                )
-
-            category_id = category.id
-
-        transaction.transaction_type = kind
-        transaction.amount = amount
-        transaction.account_id = source.id
-        transaction.destination_account_id = (
-            destination.id
-            if destination
-            else None
-        )
-        transaction.category_id = category_id
-
-        if "merchant" in data:
-            transaction.merchant = (
-                data.get("merchant") or ""
-            ).strip() or None
-
-        if "description" in data:
-            transaction.description = (
-                data.get("description") or ""
-            ).strip() or None
-
-        if "notes" in data:
-            transaction.notes = (
-                data.get("notes") or ""
-            ).strip() or None
-
-        if "transaction_date" in data:
-            transaction.transaction_date = (
-                parse_date(
-                    data.get("transaction_date")
-                )
-            )
-
-        if "is_recurring" in data:
-            transaction.is_recurring = bool(
-                data.get("is_recurring")
-            )
-
-        # Apply the NEW version.
-        apply_transaction_to_accounts(
-            transaction
-        )
-
-        db.session.commit()
-
-        return jsonify({
-            "transaction": transaction.to_dict()
-        }), 200
-
-    except (ValueError, TypeError) as exc:
-        db.session.rollback()
-
-        return jsonify({
-            "error": str(exc)
-        }), 400
-
-
-@transactions_bp.delete("/<int:transaction_id>")
-@jwt_required()
-def delete_transaction(transaction_id):
-    user = current_user()
-
-    transaction = Transaction.query.filter_by(
-        id=transaction_id,
-        user_id=user.id,
-    ).first_or_404()
-
-    try:
-        apply_transaction_to_accounts(
-            transaction,
-            reverse=True,
-        )
-
-        db.session.delete(transaction)
-        db.session.commit()
-
-        return jsonify({
-            "message": "Transaction deleted."
-        }), 200
-
-    except ValueError as exc:
-        db.session.rollback()
-
-        return jsonify({
-            "error": str(exc)
-        }), 400
+        vals=validate(body(),user,tx) if request.method!='DELETE' else None
+        ids=[tx.account_id,tx.destination_account_id]
+        if vals:ids.extend([vals['account_id'],vals['destination_account_id']])
+        accounts=lock_accounts(user,ids)
+        apply(tx,accounts,reverse=True)
+        if request.method=='DELETE':db.session.delete(tx);db.session.commit();return jsonify(message='Transaction deleted.')
+        for k,v in vals.items():setattr(tx,k,v)
+        apply(tx,accounts)
+        db.session.commit();return jsonify(transaction=tx.to_dict())
+    except (ValueError,TypeError) as e:db.session.rollback();return fail(e)

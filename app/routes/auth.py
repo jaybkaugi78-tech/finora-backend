@@ -1,49 +1,133 @@
 
-from flask import Blueprint, jsonify, request
-from flask_jwt_extended import create_access_token
-from app.extensions import db
-from app.models import Account, User
+from flask import Blueprint, jsonify
+from flask_jwt_extended import (
+    create_access_token,
+    create_refresh_token,
+    get_jwt_identity,
+    jwt_required,
+)
+from sqlalchemy.exc import IntegrityError
+
+from ..extensions import db, limiter
+from ..models import User
+from .common import body, fail
 from app.services.category_service import create_default_categories
 
-auth_bp = Blueprint("auth", __name__)
 
-@auth_bp.post("/register")
+bp = Blueprint("auth", __name__)
+
+
+def auth_response(user, status=200):
+    access_token = create_access_token(identity=str(user.id))
+    refresh_token = create_refresh_token(identity=str(user.id))
+
+    return jsonify(
+        access_token=access_token,
+        token=access_token,
+        refresh_token=refresh_token,
+        user=user.to_dict(),
+    ), status
+
+
+@bp.post("/auth/register")
+@limiter.limit("5 per minute")
 def register():
-    data = request.get_json() or {}
-    full_name = (data.get("full_name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
+    data = body()
+
+    name = str(
+        data.get("full_name") or data.get("name") or ""
+    ).strip()
+
+    email = str(
+        data.get("email") or ""
+    ).strip().lower()
+
     password = data.get("password") or ""
 
-    if not full_name or not email or not password:
-        return jsonify({"error": "Full name, email and password are required."}), 400
-    if len(password) < 8:
-        return jsonify({"error": "Password must be at least 8 characters."}), 400
+    if (
+        not name
+        or "@" not in email
+        or not isinstance(password, str)
+        or len(password) < 10
+    ):
+        return fail(
+            "Name, valid email and password of at least "
+            "10 characters required."
+        )
+
     if User.query.filter_by(email=email).first():
-        return jsonify({"error": "An account with that email already exists."}), 409
+        return fail("Email already registered.", 409)
 
-    user = User(full_name=full_name, email=email)
-    user.set_password(password)
-    db.session.add(user)
-    db.session.flush()
+    try:
+        user = User(
+            full_name=name,
+            email=email,
+        )
 
-    db.session.add(Account(
-        user_id=user.id, name="M-Pesa", account_type="mobile_money",
-        currency="KES", balance=0, is_default=True
-    ))
-    create_default_categories(user.id)
-    db.session.commit()
+        user.set_password(password)
 
-    token = create_access_token(identity=str(user.id))
-    return jsonify({"access_token": token, "user": user.to_dict()}), 201
+        db.session.add(user)
 
-@auth_bp.post("/login")
+        # Assign the user's ID without committing.
+        db.session.flush()
+
+        # Create their default income and expense categories.
+        create_default_categories(user.id)
+
+        # Commit both the user and categories together.
+        db.session.commit()
+
+    except IntegrityError:
+        db.session.rollback()
+        return fail("Email already registered.", 409)
+
+    except Exception:
+        db.session.rollback()
+        raise
+
+    return auth_response(user, 201)
+
+
+@bp.post("/auth/login")
+@limiter.limit("10 per minute")
 def login():
-    data = request.get_json() or {}
-    email = (data.get("email") or "").strip().lower()
+    data = body()
+
+    email = str(
+        data.get("email") or ""
+    ).strip().lower()
+
     password = data.get("password") or ""
+
     user = User.query.filter_by(email=email).first()
+
     if not user or not user.check_password(password):
-        return jsonify({"error": "Invalid email or password."}), 401
-    if not user.is_active:
-        return jsonify({"error": "This account is disabled."}), 403
-    return jsonify({"access_token": create_access_token(identity=str(user.id)), "user": user.to_dict()}), 200
+        return fail("Invalid credentials.", 401)
+
+    return auth_response(user)
+
+
+@bp.post("/auth/refresh")
+@jwt_required(refresh=True)
+def refresh():
+    identity = get_jwt_identity()
+
+    access_token = create_access_token(identity=identity)
+
+    return jsonify(
+        access_token=access_token,
+        token=access_token,
+    )
+
+
+@bp.get("/auth/me")
+@jwt_required()
+def me():
+    user_id = int(get_jwt_identity())
+
+    user = db.session.get(User, user_id)
+
+    if not user:
+        return fail("User not found.", 404)
+
+    return jsonify(user=user.to_dict())

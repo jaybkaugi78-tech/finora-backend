@@ -1,35 +1,19 @@
-
-from flask import Blueprint, jsonify, request
+from flask import Blueprint,jsonify
 from flask_jwt_extended import jwt_required
-from app.extensions import db
-from app.models import Category
-from app.utils.auth import current_user
-
-categories_bp = Blueprint("categories", __name__)
-
-@categories_bp.get("")
+from ..extensions import db
+from ..models import Category
+from .common import uid,body,fail
+bp=Blueprint('categories',__name__)
+@bp.get('/categories')
 @jwt_required()
-def list_categories():
-    user = current_user()
-    q = Category.query.filter_by(user_id=user.id)
-    category_type = request.args.get("type")
-    if category_type:
-        q = q.filter_by(category_type=category_type)
-    rows = q.order_by(Category.name.asc()).all()
-    return jsonify({"categories": [c.to_dict() for c in rows]}), 200
-
-@categories_bp.post("")
+def listing():
+    q=Category.query.filter_by(user_id=uid())
+    from flask import request
+    if request.args.get('type'): q=q.filter_by(category_type=request.args['type'])
+    return jsonify(categories=[c.to_dict() for c in q.order_by(Category.name)])
+@bp.post('/categories')
 @jwt_required()
-def create_category():
-    user = current_user()
-    data = request.get_json() or {}
-    name = (data.get("name") or "").strip()
-    category_type = (data.get("category_type") or "").strip().lower()
-    if not name or category_type not in {"income", "expense"}:
-        return jsonify({"error": "Valid name and category_type are required."}), 400
-    if Category.query.filter_by(user_id=user.id, name=name, category_type=category_type).first():
-        return jsonify({"error": "Category already exists."}), 409
-    category = Category(user_id=user.id, name=name, category_type=category_type, icon=data.get("icon"), is_default=False)
-    db.session.add(category)
-    db.session.commit()
-    return jsonify({"category": category.to_dict()}), 201
+def create():
+    d=body();name=str(d.get('name') or '').strip();typ=d.get('category_type') or d.get('type') or 'expense'
+    if not name or typ not in ('income','expense'): return fail('Valid name and category type required.')
+    c=Category(user_id=uid(),name=name,category_type=typ);db.session.add(c);db.session.commit();return jsonify(category=c.to_dict()),201
