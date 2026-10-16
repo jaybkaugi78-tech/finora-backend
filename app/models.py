@@ -138,3 +138,72 @@ class IdempotencyKey(db.Model):
     response_json=db.Column(db.JSON,nullable=False)
     created_at=db.Column(db.DateTime,default=datetime.utcnow)
     __table_args__=(db.UniqueConstraint('user_id','key'),)
+
+
+class NotificationDismissal(db.Model):
+    __tablename__ = "notification_dismissals"
+
+    id = db.Column(
+        db.Integer,
+        primary_key=True,
+    )
+
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+
+    dedupe_key = db.Column(
+        db.String(255),
+        nullable=False,
+    )
+
+    dismissed_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "user_id",
+            "dedupe_key",
+            name="uq_notification_dismissal_user_key",
+        ),
+    )
+
+from datetime import datetime, timezone
+
+
+class RevokedToken(db.Model):
+    __tablename__ = "revoked_tokens"
+
+    id = db.Column(
+        db.Integer,
+        primary_key=True,
+    )
+
+    jti = db.Column(
+        db.String(64),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+
+    token_type = db.Column(
+        db.String(20),
+        nullable=False,
+    )
+
+    revoked_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    expires_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+    )
