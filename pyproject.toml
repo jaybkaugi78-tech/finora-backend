@@ -11,6 +11,7 @@ dependencies = [
     "Flask-JWT-Extended>=4.6,<5",
     "Flask-Cors>=4,<6",
     "Flask-Limiter[redis]>=3.8,<5",
+    "psycopg[binary]>=3.2,<4",
     "psycopg2-binary>=2.9,<3",
     "python-dotenv>=1,<2",
     "gunicorn>=22,<24",
