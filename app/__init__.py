@@ -1,6 +1,7 @@
 
 import os
 from datetime import timedelta
+from urllib.parse import urlsplit, urlunsplit
 
 from flask import Flask, jsonify
 from dotenv import load_dotenv
@@ -13,6 +14,47 @@ from .extensions import (
     cors,
     limiter,
 )
+
+
+def configure_rate_limit_storage(app, is_production):
+    raw_uri = os.getenv(
+        "RATELIMIT_STORAGE_URI",
+        "memory://",
+    ).strip().strip('"').strip("'")
+
+    if is_production and not raw_uri.startswith(
+        ("redis://", "rediss://")
+    ):
+        raise RuntimeError(
+            "Production requires Redis rate-limit storage."
+        )
+
+    if raw_uri.startswith("rediss://"):
+        # Flask-Limiter/limits uses redis:// as the
+        # storage scheme and can enable TLS via options.
+        parsed = urlsplit(raw_uri)
+
+        raw_uri = urlunsplit((
+            "redis",
+            parsed.netloc,
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
+        ))
+
+        app.config["RATELIMIT_STORAGE_OPTIONS"] = {
+            "connection_pool": None,
+            "ssl": True,
+            "ssl_cert_reqs": "required",
+        }
+
+    elif is_production:
+        raise RuntimeError(
+            "Production Redis connection must use TLS "
+            "(rediss://)."
+        )
+
+    app.config["RATELIMIT_STORAGE_URI"] = raw_uri
 
 
 def create_app(test_config=None):
@@ -49,11 +91,11 @@ def create_app(test_config=None):
         JWT_SECRET_KEY=jwt_secret,
 
         JWT_ACCESS_TOKEN_EXPIRES=timedelta(
-            hours=2
+            hours=2,
         ),
 
         JWT_REFRESH_TOKEN_EXPIRES=timedelta(
-            days=14
+            days=14,
         ),
 
         JWT_BLOCKLIST_ENABLED=True,
@@ -73,7 +115,7 @@ def create_app(test_config=None):
     if not app.config.get("TESTING"):
         if len(app.config["JWT_SECRET_KEY"]) < 32:
             raise RuntimeError(
-                "Set JWT_SECRET_KEY in .env "
+                "Set JWT_SECRET_KEY "
                 "(at least 32 characters)."
             )
 
@@ -85,14 +127,11 @@ def create_app(test_config=None):
                 "Production requires PostgreSQL."
             )
 
-        if os.getenv(
-            "RATELIMIT_STORAGE_URI",
-            "memory://",
-        ).startswith("memory://"):
-            raise RuntimeError(
-                "Production requires persistent "
-                "rate-limit storage such as Redis."
-            )
+    # Configure Redis rate limiting
+    configure_rate_limit_storage(
+        app,
+        is_production,
+    )
 
     # Initialize extensions
     db.init_app(app)
@@ -129,11 +168,11 @@ def create_app(test_config=None):
         },
     )
 
-    # Import models so migrations can discover them.
+    # Import models for migrations
     from . import models  # noqa: F401
     from .models import RevokedToken
 
-    # Reject revoked access and refresh tokens.
+    # JWT token revocation
     @jwt.token_in_blocklist_loader
     def check_if_token_revoked(
         jwt_header,
@@ -164,9 +203,7 @@ def create_app(test_config=None):
     # Health endpoint
     @app.get("/api/health")
     def health():
-        return jsonify(
-            status="ok",
-        )
+        return jsonify(status="ok")
 
     # Security headers
     @app.after_request
@@ -201,7 +238,6 @@ def create_app(test_config=None):
 
         return response
 
-    # Database conflict handler
     @app.errorhandler(IntegrityError)
     def integrity_error(error):
         db.session.rollback()
@@ -213,14 +249,12 @@ def create_app(test_config=None):
             )
         ), 409
 
-    # Missing endpoint handler
     @app.errorhandler(404)
     def missing(error):
         return jsonify(
             error="Endpoint not found."
         ), 404
 
-    # Rate limit handler
     @app.errorhandler(429)
     def limited(error):
         return jsonify(
@@ -230,7 +264,6 @@ def create_app(test_config=None):
             )
         ), 429
 
-    # Internal server error handler
     @app.errorhandler(500)
     def server_error(error):
         db.session.rollback()
